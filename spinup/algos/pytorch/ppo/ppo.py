@@ -261,6 +261,30 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
 
+        # Value function learning
+        for i in range(train_v_iters):
+            vf_optimizer.zero_grad()
+            loss_v = compute_loss_v(data)
+            loss_v.backward()
+            mpi_avg_grads(ac.v)    # average grads across MPI processes
+            vf_optimizer.step()
+
+        logger.store(StopIter=i)
+
+        with torch.no_grad():
+            data['val'] = ac.v(data['obs']).detach().numpy()
+        
+        for start, end, o in paths:
+            buf.path_start_idx, buf.ptr = start, end
+            if o is None:
+                v = 0
+            else:
+                with torch.no_grad():
+                    v = ac.v(torch.as_tensor(o, dtype=torch.float32)).item()
+            buf.finish_path(v)
+
+        data = buf.get()
+
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
@@ -272,16 +296,6 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi.backward()
             mpi_avg_grads(ac.pi)    # average grads across MPI processes
             pi_optimizer.step()
-
-        logger.store(StopIter=i)
-
-        # Value function learning
-        for i in range(train_v_iters):
-            vf_optimizer.zero_grad()
-            loss_v = compute_loss_v(data)
-            loss_v.backward()
-            mpi_avg_grads(ac.v)    # average grads across MPI processes
-            vf_optimizer.step()
 
         # Log changes from update
         kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
@@ -296,6 +310,7 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
+        paths = []
         for t in range(local_steps_per_epoch):
             a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
 
@@ -321,7 +336,9 @@ def ppo(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 if timeout or epoch_ended:
                     _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
                 else:
+                    o = None
                     v = 0
+                paths.append((buf.path_start_idx, buf.ptr, o))
                 buf.finish_path(v)
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
